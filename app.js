@@ -8,10 +8,10 @@
 //   WEB_APP_URL   — only needed if you host tapminer.html somewhere else.
 //                    Leave unset and this server serves it for you at /tapminer.html
 //   CHANNEL_USERNAME — public channel to verify, e.g. @tapminer_news (defaults to that)
-//   GROUP_CHAT_ID    — numeric chat id of the private group mission. To get it:
-//                       1) add this bot to the group as a member (admin not required to read status,
-//                          but Telegram sometimes requires it for private groups — safest to add as admin)
-//                       2) send /chatid in that group — the bot replies with the id to put here
+//   GROUP_CHAT_ID    — numeric chat id of the private group mission.
+//   FIREBASE_DB_URL  — a free Firebase Realtime Database URL. Set this so player
+//                      progress survives redeploys — Render's free tier wipes local
+//                      files (db.json) every time you push a change.
 // Render sets these automatically, you don't need to add them:
 //   RENDER_EXTERNAL_URL — this service's own public URL
 //   PORT
@@ -30,9 +30,13 @@ const DB_FILE = path.join(__dirname, 'db.json');
 const WEBHOOK_PATH = '/telegraf-webhook';
 const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || '@tapminer_news';
 const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID || '-1002645219026';
+const FIREBASE_DB_URL = (process.env.FIREBASE_DB_URL || '').replace(/\/$/, '');
 
 if (!BOT_TOKEN) { console.error('Missing BOT_TOKEN environment variable.'); process.exit(1); }
-if (!WEB_APP_URL) { console.error('Could not determine the Mini App URL. Set WEB_APP_URL manually, or deploy on a host that provides a public URL automatically (e.g. Render sets RENDER_EXTERNAL_URL).'); process.exit(1); }
+if (!WEB_APP_URL) { console.error('Could not determine the Mini App URL.'); process.exit(1); }
+if (!FIREBASE_DB_URL) {
+  console.warn('FIREBASE_DB_URL not set — player progress is saved to a local file and WILL be lost on the next redeploy.');
+}
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -43,13 +47,19 @@ bot.start((ctx) => {
   );
 });
 bot.help((ctx) => ctx.reply('Tap /start to open the Tapminer Mini App and start mining.'));
-// Handy one-off command: run this inside your private group once the bot is added,
-// then copy the id it replies with into the GROUP_CHAT_ID environment variable.
 bot.command('chatid', (ctx) => ctx.reply(`This chat's id is: ${ctx.chat.id}`));
 
 const app = express();
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag: false,
+  lastModified: false,
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+}));
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -59,12 +69,57 @@ app.use((req, res, next) => {
   next();
 });
 
-// --- Telegram webhook endpoint ---
 app.use(bot.webhookCallback(WEBHOOK_PATH));
 
-// --- Game state API (same logic as before, now sharing this one service) ---
-function readDB() { try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (err) { return {}; } }
-function writeDB(db) { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
+// --- Persistent storage layer ---
+function readLocalDB() { try { return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); } catch (err) { return {}; } }
+function writeLocalDB(db) { fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
+
+async function getPlayer(id) {
+  if (FIREBASE_DB_URL) {
+    try {
+      const res = await fetch(`${FIREBASE_DB_URL}/players/${id}.json`);
+      return await res.json();
+    } catch (err) {
+      console.error('Firebase read error:', err.message);
+      return null;
+    }
+  }
+  const db = readLocalDB();
+  return db[id] || null;
+}
+
+async function setPlayer(id, data) {
+  if (FIREBASE_DB_URL) {
+    try {
+      await fetch(`${FIREBASE_DB_URL}/players/${id}.json`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      });
+    } catch (err) {
+      console.error('Firebase write error:', err.message);
+    }
+    return;
+  }
+  const db = readLocalDB();
+  db[id] = data;
+  writeLocalDB(db);
+}
+
+async function getAllPlayers() {
+  if (FIREBASE_DB_URL) {
+    try {
+      const res = await fetch(`${FIREBASE_DB_URL}/players.json`);
+      const data = await res.json();
+      return data || {};
+    } catch (err) {
+      console.error('Firebase read error:', err.message);
+      return {};
+    }
+  }
+  return readLocalDB();
+}
 
 function verifyInitData(initData) {
   if (!initData) return null;
@@ -87,20 +142,23 @@ function requireTelegramUser(req, res, next) {
   next();
 }
 
-app.get('/api/state', requireTelegramUser, (req, res) => {
-  const db = readDB();
-  res.json(db[req.tgUser.id] || null);
+app.get('/api/state', requireTelegramUser, async (req, res) => {
+  try {
+    const player = await getPlayer(req.tgUser.id);
+    res.json(player || null);
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load state' });
+  }
 });
-app.post('/api/state', requireTelegramUser, (req, res) => {
-  const db = readDB();
-  db[req.tgUser.id] = req.body;
-  writeDB(db);
-  res.json({ ok: true });
+app.post('/api/state', requireTelegramUser, async (req, res) => {
+  try {
+    await setPlayer(req.tgUser.id, req.body);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not save state' });
+  }
 });
 
-// Verifies real Telegram membership for the "join channel/group" missions.
-// ?target=channel  -> checks CHANNEL_USERNAME
-// ?target=group    -> checks GROUP_CHAT_ID (only works once that env var is set)
 app.get('/api/check-membership', requireTelegramUser, async (req, res) => {
   const target = req.query.target;
   let chatId = null;
@@ -113,7 +171,6 @@ app.get('/api/check-membership', requireTelegramUser, async (req, res) => {
     const isMember = ['member', 'administrator', 'creator'].includes(member.status);
     res.json({ isMember });
   } catch (err) {
-    // Most common cause: the bot itself isn't a member/admin of that chat yet.
     console.error('getChatMember failed:', err.message);
     res.status(200).json({ isMember: false, error: 'Could not verify — make sure the bot is added to that chat as an admin' });
   }
@@ -121,10 +178,6 @@ app.get('/api/check-membership', requireTelegramUser, async (req, res) => {
 
 app.get('/health', (req, res) => res.send('Tapminer bot + API is running'));
 
-// --- 90-day promo code drop ---
-// Codes live ONLY here on the server — they're never sent to the browser,
-// so nobody can view-source their way to tomorrow's code.
-// One code unlocks per calendar day, starting the day this server first goes live.
 const PROMO_START = new Date('2026-07-16T00:00:00Z');
 const PROMO_REWARD = 500;
 const REQUIRED_DAILY_QUEST_IDS = ['tap50', 'earn2000', 'boost', 'visitshop'];
@@ -149,18 +202,22 @@ const PROMO_CODES = [
   'MHV69PZO22', 'ZKE13HJX01', 'QBY09YBW15', 'KSH29JGI98', 'JHN49ERB94',
 ];
 
+// Day boundary aligned to 7:00 AM Tashkent time (UTC+5) = 02:00 UTC,
+// so server-side daily checks (promo code gating) match the client's reset time.
+const RESET_HOUR_UTC = 2;
 function todayDateKey() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${d.getUTCMonth() + 1}-${d.getUTCDate()}`;
+  const shifted = new Date(Date.now() - RESET_HOUR_UTC * 60 * 60 * 1000);
+  return `${shifted.getUTCFullYear()}-${shifted.getUTCMonth() + 1}-${shifted.getUTCDate()}`;
 }
 function daysSincePromoStart() {
-  const now = new Date();
+  const now = new Date(Date.now() - RESET_HOUR_UTC * 60 * 60 * 1000);
+  const start = new Date(PROMO_START.getTime() - RESET_HOUR_UTC * 60 * 60 * 1000);
   const utcNow = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const utcStart = Date.UTC(PROMO_START.getUTCFullYear(), PROMO_START.getUTCMonth(), PROMO_START.getUTCDate());
+  const utcStart = Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate());
   return Math.floor((utcNow - utcStart) / 86400000);
 }
 
-app.post('/api/redeem-promo', requireTelegramUser, (req, res) => {
+app.post('/api/redeem-promo', requireTelegramUser, async (req, res) => {
   const code = ((req.body && req.body.code) || '').trim().toUpperCase();
   const dayIndex = daysSincePromoStart();
 
@@ -171,8 +228,7 @@ app.post('/api/redeem-promo', requireTelegramUser, (req, res) => {
     return res.json({ ok: false, message: 'Invalid promo code.' });
   }
 
-  const db = readDB();
-  const player = db[req.tgUser.id];
+  const player = await getPlayer(req.tgUser.id);
   if (!player) {
     return res.json({ ok: false, message: 'Play a bit first so your progress is saved, then try again.' });
   }
@@ -192,16 +248,12 @@ app.post('/api/redeem-promo', requireTelegramUser, (req, res) => {
   player.promoRedeemedDates.push(today);
   player.coins = (player.coins || 0) + PROMO_REWARD;
   player.totalEarned = (player.totalEarned || 0) + PROMO_REWARD;
-  db[req.tgUser.id] = player;
-  writeDB(db);
+  await setPlayer(req.tgUser.id, player);
   res.json({ ok: true, reward: PROMO_REWARD });
 });
 
-// Leaderboard and referral stats are computed straight from everyone's saved
-// state — no separate storage needed. This only works once players save
-// through this same server (i.e. once deployed for real).
-app.get('/api/leaderboard', requireTelegramUser, (req, res) => {
-  const db = readDB();
+app.get('/api/leaderboard', requireTelegramUser, async (req, res) => {
+  const db = await getAllPlayers();
   const entries = Object.entries(db).map(([id, s]) => ({
     id: 'tg' + id,
     nickname: (s && s.nickname) || 'Miner',
@@ -212,8 +264,8 @@ app.get('/api/leaderboard', requireTelegramUser, (req, res) => {
   res.json(entries.slice(0, 60));
 });
 
-app.get('/api/referral-stats', requireTelegramUser, (req, res) => {
-  const db = readDB();
+app.get('/api/referral-stats', requireTelegramUser, async (req, res) => {
+  const db = await getAllPlayers();
   const myId = 'tg' + req.tgUser.id;
   let count = 0;
   Object.values(db).forEach((s) => { if (s && s.referredBy === myId) count += 1; });
@@ -230,6 +282,6 @@ app.listen(PORT, async () => {
       console.error('Failed to set webhook:', err.message);
     }
   } else {
-    console.warn('PUBLIC_URL/RENDER_EXTERNAL_URL not set yet — webhook will be set on next deploy once Render assigns a URL.');
+    console.warn('PUBLIC_URL/RENDER_EXTERNAL_URL not set yet.');
   }
 });
